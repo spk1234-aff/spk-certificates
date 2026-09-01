@@ -568,6 +568,22 @@ function downloadErrorMessage(err){
   return 'ดาวน์โหลดอัตโนมัติไม่สำเร็จ ใช้วิธีบันทึกภาพด้วยมือแทน';
 }
 
+function tryNativeBrowserDownload(blob, filename){
+  try{
+    if (!blob || typeof URL === 'undefined' || !URL.createObjectURL) return false;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(()=>{ try{ URL.revokeObjectURL(url); }catch(e){} }, 4000);
+    return true;
+  }catch(e){ return false; }
+}
+
 async function exportCertificate(batchId, recipientId, format){
   const batch = APP.state.batches.find(b=>b.id===batchId);
   const recipient = batch && batch.recipients.find(r=>r.id===recipientId);
@@ -584,14 +600,20 @@ async function exportCertificate(batchId, recipientId, format){
     const doc = new window.jspdf.jsPDF({ orientation: w>=h?'landscape':'portrait', unit:'px', format:[w,h] });
     doc.addImage(canvas.toDataURL('image/jpeg',0.93), 'JPEG', 0, 0, w, h);
     const blob = doc.output('blob');
-    if (!downloads){ showManualSaveModal(canvas, safeName); return; }
+    if (!downloads){
+      if (tryNativeBrowserDownload(blob, safeName+'.pdf')){ showToast('ดาวน์โหลดเกียรติบัตรสำเร็จ', 'success'); return; }
+      showManualSaveModal(canvas, safeName); return;
+    }
     try{ await downloads.save({ filename: safeName+'.pdf', data: blob }); showToast('ดาวน์โหลดเกียรติบัตรสำเร็จ', 'success'); }
     catch(err){ showToast(downloadErrorMessage(err),'error'); if (err && err.code!=='declined') showManualSaveModal(canvas, safeName); }
     return;
   }
 
   canvas.toBlob(async (blob)=>{
-    if (!downloads){ showManualSaveModal(canvas, safeName); return; }
+    if (!downloads){
+      if (tryNativeBrowserDownload(blob, safeName+'.png')){ showToast('ดาวน์โหลดเกียรติบัตรสำเร็จ', 'success'); return; }
+      showManualSaveModal(canvas, safeName); return;
+    }
     try{ await downloads.save({ filename: safeName+'.png', data: blob }); showToast('ดาวน์โหลดเกียรติบัตรสำเร็จ', 'success'); }
     catch(err){ showToast(downloadErrorMessage(err),'error'); if (err && err.code!=='declined') showManualSaveModal(canvas, safeName); }
   }, 'image/png');
