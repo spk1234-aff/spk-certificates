@@ -1573,6 +1573,77 @@ function onGlobalClick(e){
   if (e.target.hasAttribute && e.target.hasAttribute('data-close-modal')) closeModal();
 }
 
+/* ============================== DIAGNOSTICS (?debug=1) ============================== */
+async function runDiagnostics(){
+  if (!/[?&]debug=1\b/.test(location.search)) return;
+  const lines = [];
+  try{
+    lines.push('userAgent: ' + navigator.userAgent);
+    lines.push('devicePixelRatio: ' + window.devicePixelRatio);
+    lines.push('window.claude exists: ' + !!(window.claude));
+    lines.push('window.claude.use exists: ' + !!(window.claude && window.claude.use));
+    lines.push('document.fonts exists: ' + !!(document.fonts));
+    lines.push('document.fonts.check exists: ' + !!(document.fonts && document.fonts.check));
+
+    const batch = APP.state.batches[0];
+    const recipient = (batch && (batch.recipients.find(r=>r.certNo==='5229') || batch.recipients[0])) || null;
+    if (!batch || !recipient){
+      lines.push('--- no batch/recipient data to test ---');
+    } else {
+      lines.push('---');
+      lines.push('recipient: ' + recipient.name + ' / ' + recipient.certNo);
+      const fields = batch.fields || {};
+      for (const key of ['name','certNo','note']){
+        const f = fields[key];
+        lines.push('');
+        if (!f){ lines.push(key+': (no field config)'); continue; }
+        const text = String(recipient[key]||'').trim();
+        const weight = f.bold ? '700' : '500';
+        const fontSpec = weight+' '+f.fontSizePx+'px "'+f.fontFamily+'", "IBM Plex Sans Thai", sans-serif';
+        lines.push(key+' enabled=' + f.enabled + ' text="' + text + '"');
+        lines.push('  fontSpec: ' + fontSpec);
+        try{
+          if (typeof warmUpFontForCanvas === 'function') warmUpFontForCanvas(f.fontFamily, weight, f.fontSizePx);
+          if (document.fonts && document.fonts.load){ await document.fonts.load(fontSpec); await document.fonts.ready; }
+        }catch(e){ lines.push('  font load error: ' + e.message); }
+        lines.push('  fonts.check(spec) after load: ' + (document.fonts && document.fonts.check ? document.fonts.check(fontSpec) : 'n/a'));
+
+        const sample = text || 'ทดสอบ Aa 0123';
+        const tCanvas = document.createElement('canvas');
+        const tctx = tCanvas.getContext('2d');
+        tctx.font = fontSpec;
+        const wIntended = tctx.measureText(sample).width;
+        tctx.font = weight + ' ' + f.fontSizePx + 'px monospace';
+        const wFallback = tctx.measureText(sample).width;
+        lines.push('  width @intended font: ' + wIntended.toFixed(1) + 'px');
+        lines.push('  width @generic "monospace" fallback: ' + wFallback.toFixed(1) + 'px' + (Math.abs(wIntended-wFallback) < 1 ? '  <-- SAME AS INTENDED: custom font likely NOT applied' : ''));
+
+        if (text && batch.template){
+          const canvasW = batch.template.width;
+          const maxW = f.maxWidthPct ? canvasW * (f.maxWidthPct/100) : undefined;
+          tctx.font = fontSpec;
+          const lns = (typeof wrapCanvasLines === 'function') ? wrapCanvasLines(tctx, text, maxW) : ['(wrapCanvasLines unavailable)'];
+          lines.push('  canvas width: ' + canvasW + 'px, maxW: ' + (maxW ? maxW.toFixed(0) : 'none') + 'px');
+          lines.push('  wrapped into ' + lns.length + ' line(s):');
+          lns.forEach((ln,i)=>{
+            const lw = tctx.measureText(ln).width;
+            lines.push('    line ' + (i+1) + ': "' + ln + '" width=' + lw.toFixed(1) + 'px' + (maxW && lw > maxW ? '  <-- OVER maxW, safety clamp should trigger' : ''));
+          });
+        }
+      }
+    }
+  }catch(e){
+    lines.push('');
+    lines.push('DIAGNOSTIC ERROR: ' + (e && e.message) + '\n' + (e && e.stack));
+  }
+
+  const panel = document.createElement('pre');
+  panel.id = 'debug-panel';
+  panel.style.cssText = 'position:fixed; inset:0; z-index:99999; margin:0; padding:14px; background:#0b0f1a; color:#9fe870; font:11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow:auto; white-space:pre-wrap; word-break:break-word;';
+  panel.textContent = lines.join('\n');
+  document.body.appendChild(panel);
+}
+
 /* ============================== INIT ============================== */
 function init(){
   document.addEventListener('click', onGlobalClick);
@@ -1582,6 +1653,7 @@ function init(){
   });
   document.addEventListener('keydown', e=>{ if (e.key==='Escape') closeModal(); });
   render();
+  runDiagnostics();
 }
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
 else init();
