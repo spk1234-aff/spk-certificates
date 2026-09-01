@@ -516,6 +516,27 @@ function wrapCanvasLines(ctx, text, maxWidth){
   return finalLines;
 }
 
+// Safari/iOS has a long-standing, well-documented bug class where a web font can
+// report as "loaded" via the Font Loading API yet Canvas 2D still silently draws
+// with a fallback font, because WebKit only reliably commits to using a font for
+// <canvas> after that font has actually been laid out in the DOM at least once.
+// Rendering a tiny, real (not display:none) element with the target font forces
+// that DOM layout pass so the subsequent canvas fillText() actually uses it —
+// without this, wrong glyph widths silently change line-wrapping and therefore
+// the computed vertical centering, which shows up as "shifted" text on iOS only.
+const _fontWarmupDone = new Set();
+function warmUpFontForCanvas(fontFamily, weight, fontSizePx){
+  const key = fontFamily+'|'+weight;
+  if (_fontWarmupDone.has(key)) return;
+  _fontWarmupDone.add(key);
+  const el = document.createElement('span');
+  el.textContent = 'กขคง วรรณยุกต์ 0123 Aa';
+  el.setAttribute('aria-hidden', 'true');
+  el.style.cssText = 'position:fixed; left:-9999px; top:0; visibility:hidden; pointer-events:none; white-space:nowrap; font-weight:'+weight+'; font-family:"'+fontFamily+'", "IBM Plex Sans Thai", sans-serif; font-size:'+fontSizePx+'px;';
+  document.body.appendChild(el);
+  void el.offsetWidth; // force a synchronous layout pass with this font applied
+}
+
 async function renderCertificateCanvas(batch, values){
   values = values || {};
   const img = await loadImage(batch.template.dataUrl);
@@ -535,7 +556,19 @@ async function renderCertificateCanvas(batch, values){
     const weight = f.bold ? '700' : '500';
     const fontSpec = weight+' '+f.fontSizePx+'px "'+f.fontFamily+'", "IBM Plex Sans Thai", sans-serif';
     try{
-      if (document.fonts && document.fonts.load){ await document.fonts.load(fontSpec); await document.fonts.ready; }
+      warmUpFontForCanvas(f.fontFamily, weight, f.fontSizePx);
+      if (document.fonts && document.fonts.load){
+        await document.fonts.load(fontSpec);
+        await document.fonts.ready;
+        // Belt-and-suspenders for WebKit/iOS: document.fonts.ready has been known
+        // to resolve slightly before the font is actually usable by <canvas>. If
+        // the font still isn't reported ready, give it one more short beat and
+        // re-check rather than silently drawing with a fallback font.
+        if (document.fonts.check && !document.fonts.check(fontSpec)){
+          await new Promise(r=>setTimeout(r, 60));
+          await document.fonts.load(fontSpec).catch(()=>{});
+        }
+      }
     }catch(e){ /* proceed with fallback font */ }
     ctx.font = fontSpec;
     ctx.fillStyle = f.color;
