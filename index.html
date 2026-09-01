@@ -594,7 +594,23 @@ async function renderCertificateCanvas(batch, values){
       const ascent = hasBounds ? m.actualBoundingBoxAscent : f.fontSizePx * 0.72;
       const descent = hasBounds ? m.actualBoundingBoxDescent : f.fontSizePx * 0.22;
       const baselineY = lineCenterY + (ascent - descent) / 2;
-      ctx.fillText(line, x, baselineY);
+      // Final safety net: wrapCanvasLines decided how to break lines using
+      // measureText() with whatever font was resolved at that moment. If the
+      // font that actually paints (fillText) ends up even slightly wider —
+      // seen on iOS/WebKit when a custom font isn't fully committed for canvas
+      // use yet — a line can run past the certificate edge and clip invisibly.
+      // Re-measuring right here and compressing only if still too wide keeps
+      // every line visible no matter which font actually gets painted.
+      if (maxW && m.width > maxW){
+        const scale = maxW / m.width;
+        ctx.save();
+        ctx.translate(x, baselineY);
+        ctx.scale(scale, 1);
+        ctx.fillText(line, 0, 0);
+        ctx.restore();
+      } else {
+        ctx.fillText(line, x, baselineY);
+      }
     });
   }
   return canvas;
