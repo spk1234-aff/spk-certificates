@@ -487,26 +487,54 @@ function compressImageFile(file, maxDim, quality){
 }
 
 /* ============================== CERTIFICATE TEXT FITTING ==============================
- * Rewritten from scratch after several rounds of iOS/Safari text-overflow bugs. The
- * design now follows one strict rule: every sizing decision — wrapping, vertical
- * centering, AND the overflow safety clamp — is driven by exactly one measurement
- * function, measureRenderedText() below, and nothing else. It never calls or trusts
- * ctx.measureText(): on-device diagnostics from a real Safari confirmed it can
- * under-report how wide fillText() actually paints. And it never scans the shared
- * production canvas either (an earlier attempt did this and regressed badly — any
- * decorative certificate artwork sharing that row of pixels, e.g. a side banner or
- * an underline, got mistaken for overflowing text and every field ended up squeezed).
- * Instead it draws ONLY the candidate text onto a small, brand-new, otherwise-empty
- * canvas and reads back the real ink — nothing else is ever drawn there, so there is
- * nothing else it could mistakenly pick up. Using this one function everywhere means
- * the line-wrapping, the vertical centering, and the final safety check can never
- * disagree with each other about how big a piece of text really is.
+ * Rewritten twice now after iOS/Safari text bugs, so here is the reasoning behind the
+ * current split — read this before changing it again.
+ *
+ * Line-WRAPPING (where to break a long line) uses the cheap, always-available
+ * ctx.measureText(). That's deliberate: measureText() can be somewhat inaccurate on
+ * Safari, but wrapping is only an aesthetic decision about where a break falls — it
+ * is not the thing that guarantees text stays inside its box (see below), and calling
+ * it many times per line (once per word, while growing a candidate line) is cheap.
+ *
+ * The overflow SAFETY CLAMP (does this already-wrapped line actually fit, and if not,
+ * how much to compress it) instead uses measureRenderedText() below: it draws ONLY
+ * that one short line onto a small, brand-new, otherwise-empty canvas and reads back
+ * the real painted ink. This is the part that must be trustworthy, so it never trusts
+ * a browser's self-reported metric — on-device diagnostics from a real Safari
+ * confirmed ctx.measureText() there can under-report how wide fillText() actually
+ * paints.
+ *
+ * Two earlier attempts got this wrong in opposite directions, and both are worth
+ * remembering:
+ *  1) Scanning the shared PRODUCTION canvas (instead of an isolated scratch one) to
+ *     verify overflow. That picked up unrelated certificate artwork sharing the same
+ *     row of pixels (a side banner, an underline) as if it were overflowing text, so
+ *     the clamp fired constantly and every field on every certificate got squeezed.
+ *  2) Using measureRenderedText() for the WRAPPING decision too, on the full,
+ *     not-yet-wrapped line. For a long note field that meant drawing a very wide
+ *     (4000px+) scratch canvas up front — and on a real phone, if that ever fails
+ *     (a canvas-size limit, memory pressure, anything), the old fallback reported
+ *     width 0, i.e. "definitely fits". A false "it fits" is the one answer that lets
+ *     text silently run off the certificate with no wrap AND no compression, which is
+ *     exactly the failure a user hit on a real iPhone.
+ *
+ * So: measureRenderedText() is now only ever asked to measure one short, already-
+ * wrapped line (keeping its scratch canvas small), and if it still can't get a real
+ * measurement for any reason, it falls back to an intentionally INFLATED
+ * ctx.measureText() estimate rather than zero — erring toward triggering the safety
+ * clamp instead of silently skipping it.
  */
-function measureRenderedText(text, fontSpec, fontSizePx){
-  const fallback = { width: 0, ascent: fontSizePx*0.72, descent: fontSizePx*0.22 };
-  if (!text) return fallback;
+function measureRenderedText(ctx, text, fontSpec, fontSizePx){
+  const fallbackAscent = fontSizePx*0.72, fallbackDescent = fontSizePx*0.22;
+  if (!text) return { width: 0, ascent: fallbackAscent, descent: fallbackDescent };
+  // Inflated on purpose: if the real pixel measurement below fails, this is what
+  // decides whether the safety clamp fires, so it must never under-report.
+  const safeFallback = { width: Math.max(ctx.measureText(text).width * 1.3, fontSizePx*0.3), ascent: fallbackAscent, descent: fallbackDescent };
   const pad = Math.max(24, Math.round(fontSizePx*0.6));
-  const scratchW = Math.ceil(fontSizePx * text.length * 1.6) + pad*2;
+  // Capped well under common mobile canvas-size ceilings. This function is only ever
+  // called on one already-wrapped line (see above), which should never legitimately
+  // need anywhere near this much room — the cap is a backstop, not an expectation.
+  const scratchW = Math.min(4000, Math.ceil(fontSizePx * text.length * 1.6) + pad*2);
   const scratchH = Math.ceil(fontSizePx * 3);
   const baselineY = Math.round(scratchH * 0.6);
   const scratch = document.createElement('canvas');
@@ -520,7 +548,7 @@ function measureRenderedText(text, fontSpec, fontSizePx){
   sctx.fillText(text, pad, baselineY);
   let data;
   try{ data = sctx.getImageData(0, 0, scratchW, scratchH).data; }
-  catch(e){ return fallback; } // e.g. tainted canvas in some odd embedding
+  catch(e){ return safeFallback; }
   const w = scratchW;
   let minX=-1, maxX=-1, minY=-1, maxY=-1;
   for (let y=0; y<scratchH; y++){
@@ -533,7 +561,7 @@ function measureRenderedText(text, fontSpec, fontSizePx){
       }
     }
   }
-  if (minX<0) return fallback;
+  if (minX<0) return safeFallback;
   return {
     width: maxX - minX + 1,
     ascent: Math.max(1, baselineY - minY),
@@ -541,32 +569,32 @@ function measureRenderedText(text, fontSpec, fontSizePx){
   };
 }
 
-function breakLongToken(text, fontSpec, fontSizePx, maxWidth){
+function breakLongToken(ctx, text, maxWidth){
   const out = []; let chunk = '';
   for (const ch of text){
     const test = chunk+ch;
-    if (chunk && measureRenderedText(test, fontSpec, fontSizePx).width > maxWidth){ out.push(chunk); chunk = ch; }
+    if (chunk && ctx.measureText(test).width > maxWidth){ out.push(chunk); chunk = ch; }
     else { chunk = test; }
   }
   if (chunk) out.push(chunk);
   return out.length ? out : [text];
 }
-function wrapCanvasLines(text, fontSpec, fontSizePx, maxWidth){
-  if (!maxWidth || maxWidth<=0 || measureRenderedText(text, fontSpec, fontSizePx).width<=maxWidth) return [text];
+function wrapCanvasLines(ctx, text, maxWidth){
+  if (!maxWidth || maxWidth<=0 || ctx.measureText(text).width<=maxWidth) return [text];
   const words = text.split(/\s+/).filter(Boolean);
-  if (words.length<=1) return breakLongToken(text, fontSpec, fontSizePx, maxWidth);
+  if (words.length<=1) return breakLongToken(ctx, text, maxWidth);
   const lines = [];
   let current = words[0];
   for (let i=1;i<words.length;i++){
     const test = current+' '+words[i];
-    if (measureRenderedText(test, fontSpec, fontSizePx).width <= maxWidth){ current = test; }
+    if (ctx.measureText(test).width <= maxWidth){ current = test; }
     else { lines.push(current); current = words[i]; }
   }
   lines.push(current);
   const finalLines = [];
   lines.forEach(line=>{
-    if (measureRenderedText(line, fontSpec, fontSizePx).width <= maxWidth){ finalLines.push(line); return; }
-    finalLines.push(...breakLongToken(line, fontSpec, fontSizePx, maxWidth));
+    if (ctx.measureText(line).width <= maxWidth){ finalLines.push(line); return; }
+    finalLines.push(...breakLongToken(ctx, line, maxWidth));
   });
   return finalLines;
 }
@@ -633,10 +661,11 @@ async function renderCertificateCanvas(batch, values){
     const y = canvas.height * (f.yPct/100);
     const maxW = f.maxWidthPct ? canvas.width * (f.maxWidthPct/100) : undefined;
 
-    // Wrapping, vertical centering, and the overflow clamp all read from the
-    // SAME measureRenderedText() call per line, so they can never disagree.
-    const lines = wrapCanvasLines(text, fontSpec, f.fontSizePx, maxW);
-    const measured = lines.map(line => measureRenderedText(line, fontSpec, f.fontSizePx));
+    // Wrap using the cheap built-in metric (fine for an aesthetic line-break
+    // decision), then verify + center each resulting short line against real
+    // painted pixels (the part that must not be fooled by a metric quirk).
+    const lines = wrapCanvasLines(ctx, text, maxW);
+    const measured = lines.map(line => measureRenderedText(ctx, line, fontSpec, f.fontSizePx));
     const lineHeight = f.fontSizePx * 1.28;
     const totalH = lineHeight * lines.length;
     const blockTop = y - totalH/2;
@@ -1660,21 +1689,22 @@ async function runDiagnostics(){
         const tctx = tCanvas.getContext('2d');
         tctx.font = fontSpec;
         const wMeasureText = tctx.measureText(sample).width;
-        const real = (typeof measureRenderedText === 'function') ? measureRenderedText(sample, fontSpec, f.fontSizePx) : null;
+        const real = (typeof measureRenderedText === 'function') ? measureRenderedText(tctx, sample, fontSpec, f.fontSizePx) : null;
         const diffPct = (real && wMeasureText) ? Math.round(((real.width-wMeasureText)/wMeasureText)*100) : null;
-        lines.push('  width via ctx.measureText(): ' + wMeasureText.toFixed(1) + 'px  (NOT trusted by the renderer — shown for comparison only)');
-        lines.push('  width via measureRenderedText() (real ink, what the renderer actually uses): ' + (real ? real.width.toFixed(1)+'px' : 'n/a (getImageData failed)') + (diffPct!==null && Math.abs(diffPct)>=3 ? '  <-- ' + (diffPct>0?'+':'') + diffPct + '% vs measureText' : ''));
+        lines.push('  width via ctx.measureText(): ' + wMeasureText.toFixed(1) + 'px  (used only to decide where lines wrap)');
+        lines.push('  width via measureRenderedText() (real ink, drives the overflow clamp): ' + (real ? real.width.toFixed(1)+'px' : 'n/a (getImageData failed)') + (diffPct!==null && Math.abs(diffPct)>=3 ? '  <-- ' + (diffPct>0?'+':'') + diffPct + '% vs measureText' : ''));
 
         if (text && batch.template){
           const canvasW = batch.template.width;
           const maxW = f.maxWidthPct ? canvasW * (f.maxWidthPct/100) : undefined;
-          const lns = (typeof wrapCanvasLines === 'function') ? wrapCanvasLines(text, fontSpec, f.fontSizePx, maxW) : ['(wrapCanvasLines unavailable)'];
+          const lns = (typeof wrapCanvasLines === 'function') ? wrapCanvasLines(tctx, text, maxW) : ['(wrapCanvasLines unavailable)'];
           lines.push('  canvas width: ' + canvasW + 'px, maxW: ' + (maxW ? maxW.toFixed(0) : 'none') + 'px');
           lines.push('  wrapped into ' + lns.length + ' line(s):');
           lns.forEach((ln,i)=>{
-            const lm = (typeof measureRenderedText === 'function') ? measureRenderedText(ln, fontSpec, f.fontSizePx) : null;
+            const lm = (typeof measureRenderedText === 'function') ? measureRenderedText(tctx, ln, fontSpec, f.fontSizePx) : null;
             const lw = lm ? lm.width : tctx.measureText(ln).width;
-            lines.push('    line ' + (i+1) + ': "' + ln + '" width=' + lw.toFixed(1) + 'px' + (maxW && lw > maxW ? '  <-- OVER maxW, will be compressed to fit' : ''));
+            const usedFallback = lm && Math.abs(lm.width - Math.max(tctx.measureText(ln).width*1.3, f.fontSizePx*0.3)) < 0.01 && Math.abs(lm.width - tctx.measureText(ln).width) > 1;
+            lines.push('    line ' + (i+1) + ': "' + ln + '" width=' + lw.toFixed(1) + 'px' + (maxW && lw > maxW ? '  <-- OVER maxW, will be compressed to fit' : '') + (usedFallback ? '  [used inflated fallback — real pixel scan failed here]' : ''));
           });
         }
       }
