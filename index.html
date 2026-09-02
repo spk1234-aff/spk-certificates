@@ -445,42 +445,72 @@ function uid(prefix){ return prefix + '_' + Date.now().toString(36) + Math.rando
 function defaultState(){
   return {
     meta:{ schoolName:'โรงเรียนโซ่พิสัยพิทยาคม อ.โซ่พิสัย จ.บึงกาฬ', eventName:'ระบบจัดการเกียรติบัตร โรงเรียนโซ่พิสัยพิทยาคม', updatedAt:null },
-    batches:[]
+    topics:[]
   };
 }
 
+// Topics contain one or more "batches" (certificate formats/designs, e.g. "แบบที่ 1").
+// Older data only had a flat `batches` array -- migrate each into its own topic with one format.
 function loadInitialState(){
   const el = document.getElementById(DATA_ID);
   if (!el) return defaultState();
   try {
     const parsed = JSON.parse(el.textContent || '{}');
-    if (parsed && parsed.meta && Array.isArray(parsed.batches)){
-      parsed.batches.forEach(migrateBatchFields);
-      return parsed;
+    if (parsed && parsed.meta){
+      if (Array.isArray(parsed.topics)){
+        parsed.topics.forEach(t=>{
+          if (!Array.isArray(t.batches)) t.batches = [];
+          t.batches.forEach(migrateBatchFields);
+        });
+        return parsed;
+      }
+      if (Array.isArray(parsed.batches)){
+        const topics = parsed.batches.map(b=>{
+          migrateBatchFields(b);
+          return {
+            id: uid('topic'),
+            name: b.name,
+            createdAt: b.createdAt,
+            batches: [ Object.assign({}, b, { name: 'แบบที่ 1' }) ]
+          };
+        });
+        return { meta: parsed.meta, topics };
+      }
     }
   } catch(e){ /* fall through */ }
   return defaultState();
 }
 
+// Route shapes:
+//   #admin                       -> admin: topics list
+//   #admin/topic/<topicId>       -> admin: manage one topic's formats ("แบบ")
+//   (empty)                      -> public: topics list
+//   #topic/<topicId>             -> public: topic's format picker (or straight to search if it has just one format)
+//   #topic/<topicId>/item/<id>   -> public: search scoped to one format
 function parseHashRoute(){
   const h = location.hash || '';
-  if (h === '#admin') return { view:'admin', topicId:null };
-  const m = h.match(/^#topic\/(.+)$/);
-  if (m) return { view:'search', topicId: decodeURIComponent(m[1]) };
-  return { view:'search', topicId:null };
+  let m;
+  if (h === '#admin') return { view:'admin', adminTopicId:null, topicId:null, itemId:null };
+  if ((m = h.match(/^#admin\/topic\/(.+)$/))) return { view:'admin', adminTopicId: decodeURIComponent(m[1]), topicId:null, itemId:null };
+  if ((m = h.match(/^#topic\/([^/]+)\/item\/(.+)$/))) return { view:'search', adminTopicId:null, topicId: decodeURIComponent(m[1]), itemId: decodeURIComponent(m[2]) };
+  if ((m = h.match(/^#topic\/(.+)$/))) return { view:'search', adminTopicId:null, topicId: decodeURIComponent(m[1]), itemId:null };
+  return { view:'search', adminTopicId:null, topicId:null, itemId:null };
 }
 const _initialRoute = parseHashRoute();
 
 const APP = {
   state: loadInitialState(),
   view: _initialRoute.view,
-  selectedTopicId: _initialRoute.topicId,
+  adminTopicId: _initialRoute.adminTopicId, // admin: topic currently being managed (null = topics list)
+  selectedTopicId: _initialRoute.topicId,   // public: topic currently being browsed
+  selectedItemId: _initialRoute.itemId,     // public: format ("แบบ") currently being searched
   query: '',
   writable: !isExternalHost(), // optimistic on Claude; on an external host (e.g. GitHub Pages) there is no save backend at all
   wizardOpen: false,
   wizardStep: 1,
-  wizardBatch: null,       // draft batch object while creating/editing
-  editingExistingId: null, // set when editing an existing batch
+  wizardBatch: null,       // draft batch(format) object while creating/editing
+  wizardTopicId: null,     // topic the draft format belongs (or will be added) to
+  editingExistingId: null, // set when editing an existing format
   saving: false,
   recipientInputMode: 'paste', // 'paste' | 'file'
   pendingParsed: null,     // preview rows parsed from a file before confirm
@@ -508,8 +538,20 @@ function fmtDate(iso){
     return d.toLocaleDateString('th-TH',{year:'numeric',month:'short',day:'numeric'});
   }catch(e){ return ''; }
 }
+function allBatches(){
+  const out = [];
+  APP.state.topics.forEach(t=> t.batches.forEach(b=> out.push(b)));
+  return out;
+}
+function findBatchGlobal(batchId){
+  for (const t of APP.state.topics){
+    const b = t.batches.find(x=>x.id===batchId);
+    if (b) return { topic:t, batch:b };
+  }
+  return null;
+}
 function totalRecipients(){
-  return APP.state.batches.reduce((n,b)=>n+b.recipients.length,0);
+  return allBatches().reduce((n,b)=>n+b.recipients.length,0);
 }
 function estimateStateBytes(){
   try{ return new Blob([JSON.stringify(APP.state)]).size; }catch(e){ return JSON.stringify(APP.state).length; }
@@ -526,18 +568,15 @@ function showToast(msg, type){
   setTimeout(()=>{ el.style.opacity='0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),320); }, 4200);
 }
 /* ============================== SEARCH ============================== */
-function searchRecipients(query, batchId){
+function searchInBatch(query, batch){
   const q = normalizeName(stripTitle(query));
-  if (!q) return [];
+  if (!q || !batch) return [];
   const out = [];
-  const batches = batchId ? APP.state.batches.filter(b=>b.id===batchId) : APP.state.batches;
-  for (const batch of batches){
-    for (const r of batch.recipients){
-      const name = normalizeName(stripTitle(r.name));
-      const idx = name.indexOf(q);
-      if (idx === -1) continue;
-      out.push({ batch, recipient:r, score: (name===q?0:idx===0?1:2) });
-    }
+  for (const r of batch.recipients){
+    const name = normalizeName(stripTitle(r.name));
+    const idx = name.indexOf(q);
+    if (idx === -1) continue;
+    out.push({ batch, recipient:r, score: (name===q?0:idx===0?1:2) });
   }
   out.sort((a,b)=> a.score-b.score || a.recipient.name.localeCompare(b.recipient.name,'th'));
   return out.slice(0,60);
@@ -778,7 +817,8 @@ function tryNativeBrowserDownload(blob, filename){
 }
 
 async function exportCertificate(batchId, recipientId, format){
-  const batch = APP.state.batches.find(b=>b.id===batchId);
+  const found = findBatchGlobal(batchId);
+  const batch = found && found.batch;
   const recipient = batch && batch.recipients.find(r=>r.id===recipientId);
   if (!batch || !recipient) return;
   let canvas;
@@ -843,16 +883,25 @@ function render(){
 
 /* ============================== RENDER: SEARCH ============================== */
 function currentTopic(){
-  return APP.selectedTopicId ? APP.state.batches.find(b=>b.id===APP.selectedTopicId) : null;
+  return APP.selectedTopicId ? APP.state.topics.find(t=>t.id===APP.selectedTopicId) : null;
+}
+function currentItem(topic){
+  if (!topic) return null;
+  if (APP.selectedItemId) return topic.batches.find(b=>b.id===APP.selectedItemId) || null;
+  if (topic.batches.length === 1) return topic.batches[0];
+  return null;
 }
 
 function renderSearchView(){
   const topic = currentTopic();
-  return topic ? renderTopicSearchView(topic) : renderTopicListView();
+  if (!topic) return renderTopicListView();
+  const item = currentItem(topic);
+  if (!item) return renderItemPickerView(topic);
+  return renderTopicSearchView(topic, item);
 }
 
 function renderTopicListView(){
-  const topics = APP.state.batches;
+  const topics = APP.state.topics;
   return ''+
   '<section class="card search-panel">'+
     '<div class="eyebrow">เลือกหัวข้อ/กิจกรรม</div>'+
@@ -870,26 +919,56 @@ function renderTopicGrid(topics){
   if (!topics.length){
     return '<div class="empty-state">ยังไม่มีหัวข้อกิจกรรมในระบบ กรุณารอผู้ดูแลระบบเพิ่มข้อมูล</div>';
   }
-  const cards = topics.map(b=>''+
-    '<button type="button" class="topic-card" data-action="select-topic" data-batch="'+b.id+'" aria-label="เข้าดูหัวข้อ '+escapeHtml(b.name)+'">'+
-      '<div class="thumb'+(b.template && b.template.dataUrl ? '' : ' empty')+'">'+(b.template && b.template.dataUrl ? '<img src="'+b.template.dataUrl+'" alt="">' : searchIcon())+'</div>'+
+  const cards = topics.map(t=>{
+    const totalR = t.batches.reduce((n,b)=>n+b.recipients.length,0);
+    const thumbBatch = t.batches.find(b=>b.template && b.template.dataUrl);
+    const countLabel = t.batches.length>1 ? (t.batches.length+' แบบ · '+totalR+' เกียรติบัตร') : (totalR+' เกียรติบัตร');
+    return ''+
+    '<button type="button" class="topic-card" data-action="select-topic" data-topic="'+t.id+'" aria-label="เข้าดูหัวข้อ '+escapeHtml(t.name)+'">'+
+      '<div class="thumb'+(thumbBatch ? '' : ' empty')+'">'+(thumbBatch ? '<img src="'+thumbBatch.template.dataUrl+'" alt="">' : searchIcon())+'</div>'+
       '<div class="body">'+
         '<div class="eyebrow-tag">หัวข้อย่อย</div>'+
+        '<div class="title">'+escapeHtml(t.name)+'</div>'+
+        '<div class="count">'+countLabel+'</div>'+
+        '<div class="cta">ดูรายละเอียด '+chevronRightIcon()+'</div>'+
+      '</div>'+
+    '</button>';
+  }).join('');
+  return '<div class="topic-grid">'+cards+'</div>';
+}
+
+function renderItemPickerView(topic){
+  const cards = topic.batches.map(b=>''+
+    '<button type="button" class="topic-card" data-action="select-item" data-batch="'+b.id+'" aria-label="เข้าดูแบบ '+escapeHtml(b.name)+'">'+
+      '<div class="thumb'+(b.template && b.template.dataUrl ? '' : ' empty')+'">'+(b.template && b.template.dataUrl ? '<img src="'+b.template.dataUrl+'" alt="">' : searchIcon())+'</div>'+
+      '<div class="body">'+
+        '<div class="eyebrow-tag">แบบ</div>'+
         '<div class="title">'+escapeHtml(b.name)+'</div>'+
         '<div class="count">'+b.recipients.length+' เกียรติบัตร</div>'+
         '<div class="cta">ค้นหาเกียรติบัตร '+chevronRightIcon()+'</div>'+
       '</div>'+
     '</button>'
   ).join('');
-  return '<div class="topic-grid">'+cards+'</div>';
-}
-
-function renderTopicSearchView(batch){
-  const results = APP.query.trim() ? searchRecipients(APP.query, batch.id) : [];
   return ''+
   '<button type="button" class="back-link" data-action="back-to-topics">'+backIcon()+' หัวข้อทั้งหมด</button>'+
   '<section class="card search-panel">'+
-    '<div class="eyebrow">'+escapeHtml(batch.name)+'</div>'+
+    '<div class="eyebrow">'+escapeHtml(topic.name)+'</div>'+
+    '<h2>เลือกแบบเกียรติบัตร</h2>'+
+    '<p class="desc">หัวข้อนี้มีเกียรติบัตรมากกว่า 1 แบบ กรุณาเลือกแบบที่ตรงกับกิจกรรมที่ท่านเข้าร่วม</p>'+
+  '</section>'+
+  '<section class="section-gap"><div class="topic-grid">'+cards+'</div></section>';
+}
+
+function renderTopicSearchView(topic, batch){
+  const results = APP.query.trim() ? searchInBatch(APP.query, batch) : [];
+  const multi = topic.batches.length > 1;
+  const backAction = multi ? 'back-to-items' : 'back-to-topics';
+  const backLabel = multi ? (backIcon()+' '+escapeHtml(topic.name)) : (backIcon()+' หัวข้อทั้งหมด');
+  const eyebrow = multi ? (escapeHtml(topic.name)+' · '+escapeHtml(batch.name)) : escapeHtml(topic.name);
+  return ''+
+  '<button type="button" class="back-link" data-action="'+backAction+'">'+backLabel+'</button>'+
+  '<section class="card search-panel">'+
+    '<div class="eyebrow">'+eyebrow+'</div>'+
     '<h2>ดาวน์โหลดเกียรติบัตรของคุณ</h2>'+
     '<p class="desc">พิมพ์ชื่อ-นามสกุล (หรือเพียงบางส่วน) เพื่อค้นหาเกียรติบัตรในหัวข้อนี้</p>'+
     '<form id="search-form" class="search-form">'+
@@ -907,13 +986,14 @@ function updateSearchResultsOnly(){
   const el = document.getElementById('search-results-section');
   if (!el) return;
   const topic = currentTopic();
-  const results = (topic && APP.query.trim()) ? searchRecipients(APP.query, topic.id) : [];
+  const item = currentItem(topic);
+  const results = (item && APP.query.trim()) ? searchInBatch(APP.query, item) : [];
   el.innerHTML = renderSearchResults(results);
 }
 
 function renderSearchResults(results){
   if (!APP.query.trim()){
-    if (!APP.state.batches.length){
+    if (!APP.state.topics.length){
       return '<div class="empty-state">ยังไม่มีหัวข้อกิจกรรมในระบบ กรุณารอผู้ดูแลระบบเพิ่มข้อมูล</div>';
     }
     return '';
@@ -941,7 +1021,8 @@ function resultCardHtml(item){
 }
 
 async function showCertPreview(batchId, recipientId){
-  const batch = APP.state.batches.find(b=>b.id===batchId);
+  const found = findBatchGlobal(batchId);
+  const batch = found && found.batch;
   const recipient = batch && batch.recipients.find(r=>r.id===recipientId);
   if (!batch || !recipient) return;
   const root = document.getElementById('modal-root');
@@ -1011,26 +1092,73 @@ function renderAdminView(){
     (APP.writable ? '' :
     '<div class="writer-banner warn">'+warnIcon()+'<span>บัญชีนี้ไม่มีสิทธิ์บันทึกการเปลี่ยนแปลง — ดูข้อมูลได้ตามปกติ แต่การบันทึกทำได้เฉพาะเจ้าของระบบที่ล็อกอินอยู่เท่านั้น</span></div>');
   const sizeKb = Math.round(estimateStateBytes()/1024);
+  const topic = (!APP.wizardOpen && APP.adminTopicId) ? APP.state.topics.find(t=>t.id===APP.adminTopicId) : null;
+
+  const headerTitle = APP.wizardOpen
+    ? (APP.editingExistingId ? 'แก้ไขแบบเกียรติบัตร' : 'สร้างแบบเกียรติบัตรใหม่')
+    : (topic ? escapeHtml(topic.name) : 'จัดการหัวข้อเกียรติบัตร');
+
+  const backLink = (!APP.wizardOpen && topic) ?
+    '<button type="button" class="back-link" data-action="admin-back-to-topics" style="margin:-4px 0 10px;">'+backIcon()+' หัวข้อทั้งหมด</button>' : '';
+
+  const headerActions = APP.wizardOpen ? '' : (topic ?
+    '<div style="display:flex; gap:8px;">'+
+      '<button type="button" class="btn btn-ghost btn-sm" data-action="rename-topic" data-topic="'+topic.id+'">แก้ไขชื่อหัวข้อ</button>'+
+      '<button type="button" class="btn btn-danger-ghost btn-sm" data-action="delete-topic" data-topic="'+topic.id+'">'+trashIcon()+' ลบหัวข้อ</button>'+
+    '</div>'
+    :
+    '<div style="display:flex; gap:8px;">'+
+      '<button type="button" class="btn btn-ghost btn-sm" data-action="export-backup">สำรองข้อมูล (JSON)</button>'+
+      '<button type="button" class="btn btn-primary btn-sm" data-action="open-topic-modal">'+plusIcon()+' สร้างหัวข้อใหม่</button>'+
+    '</div>');
+
+  const sizeHint = APP.wizardOpen ? '' : (topic
+    ? '<p class="hint" style="margin-top:10px; color:var(--ink-faint); font-size:12px;">หัวข้อนี้มี '+topic.batches.length+' แบบ · '+topic.batches.reduce((n,b)=>n+b.recipients.length,0)+' รายชื่อทั้งหมด</p>'
+    : '<p class="hint" style="margin-top:10px; color:var(--ink-faint); font-size:12px;">ขนาดข้อมูลปัจจุบันในระบบ ~'+sizeKb+' KB จากทั้งหมด '+APP.state.topics.length+' หัวข้อ</p>');
+
   return ''+
+  backLink+
   '<section class="card" style="padding:22px 24px;">'+
     '<div class="admin-header">'+
-      '<h2>จัดการชุดกิจกรรมและเกียรติบัตร</h2>'+
-      (APP.wizardOpen ? '' : '<div style="display:flex; gap:8px;">'+
-        '<button type="button" class="btn btn-ghost btn-sm" data-action="export-backup">สำรองข้อมูล (JSON)</button>'+
-        '<button type="button" class="btn btn-primary btn-sm" data-action="open-wizard">'+plusIcon()+' สร้างชุดใหม่</button>'+
-      '</div>')+
+      '<h2>'+headerTitle+'</h2>'+
+      headerActions+
     '</div>'+
     banner+
-    '<p class="hint" style="margin-top:10px; color:var(--ink-faint); font-size:12px;">ขนาดข้อมูลปัจจุบันในระบบ ~'+sizeKb+' KB จากทั้งหมด '+APP.state.batches.length+' ชุดกิจกรรม</p>'+
+    sizeHint+
   '</section>'+
-  (APP.wizardOpen ? renderWizard() : renderBatchGrid());
+  (APP.wizardOpen ? renderWizard() : (topic ? renderAdminItemGrid(topic) : renderAdminTopicsGrid()));
 }
 
-function renderBatchGrid(){
-  const cards = APP.state.batches.map(b=>''+
+function renderAdminTopicsGrid(){
+  const topics = APP.state.topics;
+  const newTile = '<button type="button" class="new-batch-tile" data-action="open-topic-modal">'+plusIcon()+'<span>สร้างหัวข้อใหม่</span></button>';
+  if (!topics.length){
+    return '<div class="batch-grid section-gap">'+newTile+'</div>';
+  }
+  const cards = topics.map(t=>{
+    const totalR = t.batches.reduce((n,b)=>n+b.recipients.length,0);
+    const thumbBatch = t.batches.find(b=>b.template && b.template.dataUrl);
+    return ''+
+    '<div class="batch-card" data-action="open-admin-topic" data-topic="'+t.id+'" style="cursor:pointer;">'+
+      '<div class="thumb">'+(thumbBatch ? '<img src="'+thumbBatch.template.dataUrl+'" alt="">' : '')+'</div>'+
+      '<div class="topic-tag">หัวข้อ</div>'+
+      '<div class="name">'+escapeHtml(t.name)+'</div>'+
+      '<div class="count">'+t.batches.length+' แบบ · '+totalR+' รายชื่อ</div>'+
+      '<div class="row">'+
+        '<button type="button" class="btn btn-ghost btn-sm" style="flex:1;" data-action="open-admin-topic" data-topic="'+t.id+'">จัดการ</button>'+
+        '<button type="button" class="btn btn-danger-ghost btn-sm" data-action="delete-topic" data-topic="'+t.id+'">'+trashIcon()+'</button>'+
+      '</div>'+
+    '</div>';
+  }).join('');
+  return '<div class="batch-grid section-gap">'+cards+newTile+'</div>';
+}
+
+function renderAdminItemGrid(topic){
+  const newTile = '<button type="button" class="new-batch-tile" data-action="open-wizard" data-topic="'+topic.id+'">'+plusIcon()+'<span>เพิ่มแบบใหม่</span></button>';
+  const cards = topic.batches.map(b=>''+
     '<div class="batch-card">'+
       '<div class="thumb">'+(b.template? '<img src="'+b.template.dataUrl+'" alt="">' : '')+'</div>'+
-      '<div class="topic-tag">หัวข้อย่อย</div>'+
+      '<div class="topic-tag">แบบ</div>'+
       '<div class="name">'+escapeHtml(b.name)+'</div>'+
       '<div class="count">'+b.recipients.length+' รายชื่อ · '+fmtDate(b.createdAt)+'</div>'+
       '<div class="row">'+
@@ -1039,12 +1167,10 @@ function renderBatchGrid(){
       '</div>'+
     '</div>'
   ).join('');
-  return '<div class="batch-grid section-gap">'+cards+
-    '<button type="button" class="new-batch-tile" data-action="open-wizard">'+plusIcon()+'<span>สร้างชุดกิจกรรมใหม่</span></button>'+
-  '</div>';
+  return '<div class="batch-grid section-gap">'+cards+newTile+'</div>';
 }
 
-const WIZARD_STEP_LABELS = ['ชื่อกิจกรรม','แม่แบบ','รายชื่อ','ตำแหน่งข้อความ','ตรวจสอบ&บันทึก'];
+const WIZARD_STEP_LABELS = ['ชื่อแบบ','แม่แบบ','รายชื่อ','ตำแหน่งข้อความ','ตรวจสอบ&บันทึก'];
 
 function renderWizard(){
   const b = APP.wizardBatch;
@@ -1083,11 +1209,12 @@ function renderWizard(){
 }
 
 function wizardStepName(b){
+  const topic = APP.wizardTopicId ? APP.state.topics.find(t=>t.id===APP.wizardTopicId) : null;
   return ''+
   '<div class="field">'+
-    '<label for="wz-name">ชื่อหัวข้อย่อย (ชุดกิจกรรม)</label>'+
-    '<input type="text" id="wz-name" placeholder="เช่น เกียรติบัตร SPK Open House ประจำปี 2569" value="'+escapeHtml(b.name)+'">'+
-    '<div class="help">ชื่อนี้จะแสดงเป็นหัวข้อย่อยในระบบและในผลการค้นหา เพื่อให้ผู้รับทราบว่าเป็นเกียรติบัตรจากกิจกรรมใด</div>'+
+    '<label for="wz-name">ชื่อแบบเกียรติบัตร'+(topic?' (ในหัวข้อ “'+escapeHtml(topic.name)+'”)':'')+'</label>'+
+    '<input type="text" id="wz-name" placeholder="เช่น Open House แบบที่ 1 - เกียรติบัตรผู้เข้าร่วม" value="'+escapeHtml(b.name)+'">'+
+    '<div class="help">ใช้เมื่อหัวข้อเดียวกันมีเกียรติบัตรมากกว่า 1 รูปแบบ (เช่น แบบผู้เข้าร่วม, แบบกรรมการ) ชื่อนี้จะแสดงให้ผู้รับเลือกในหน้าค้นหา</div>'+
   '</div>';
 }
 
@@ -1141,7 +1268,7 @@ function renderPendingImportPreview(){
   }
   const noteValuesHtml = raw.noteValues ? (
     '<div class="field" style="margin-top:2px;">'+
-      '<label>กรองตามค่าในคอลัมน์นี้ (เลือกเฉพาะกลุ่มที่จะใช้กับชุดกิจกรรมนี้)</label>'+
+      '<label>กรองตามค่าในคอลัมน์นี้ (เลือกเฉพาะกลุ่มที่จะใช้กับแบบนี้)</label>'+
       '<div class="recipient-list" style="max-height:150px;">'+
         raw.noteValues.map(nv=>{
           const checked = !mapping.noteFilter || mapping.noteFilter.has(nv.value);
@@ -1366,8 +1493,9 @@ function toggleNextButton(){
   if (btn) btn.disabled = !computeCanNext();
 }
 
-function openWizardNew(){
+function openWizardNew(topicId){
   APP.wizardBatch = newWizardBatch();
+  APP.wizardTopicId = topicId || APP.adminTopicId || null;
   APP.editingExistingId = null;
   APP.wizardStep = 1;
   APP.wizardOpen = true;
@@ -1378,10 +1506,12 @@ function openWizardNew(){
   render();
 }
 function openWizardEdit(batchId){
-  const b = APP.state.batches.find(x=>x.id===batchId);
-  if (!b) return;
+  const found = findBatchGlobal(batchId);
+  if (!found) return;
+  const b = found.batch;
   migrateBatchFields(b);
   APP.wizardBatch = JSON.parse(JSON.stringify(b));
+  APP.wizardTopicId = found.topic.id;
   APP.editingExistingId = batchId;
   APP.wizardStep = 1;
   APP.wizardOpen = true;
@@ -1394,6 +1524,7 @@ function openWizardEdit(batchId){
 function closeWizard(){
   APP.wizardOpen = false;
   APP.wizardBatch = null;
+  APP.wizardTopicId = null;
   APP.pendingParsed = null;
   APP.pendingRaw = null;
   render();
@@ -1405,33 +1536,106 @@ async function wizardSave(){
   if (APP.saving) return;
   const b = APP.wizardBatch;
   if (!b.name.trim() || !b.template || !b.recipients.length){ showToast('ข้อมูลยังไม่ครบถ้วน','error'); return; }
+  if (!APP.wizardTopicId){ showToast('ไม่พบหัวข้อที่จะบันทึกแบบนี้ลงไป','error'); return; }
   APP.saving = true; render();
   const next = JSON.parse(JSON.stringify(APP.state));
+  const topic = next.topics.find(t=>t.id===APP.wizardTopicId);
+  if (!topic){ APP.saving = false; showToast('ไม่พบหัวข้อที่จะบันทึกแบบนี้ลงไป','error'); render(); return; }
   if (APP.editingExistingId){
-    const idx = next.batches.findIndex(x=>x.id===APP.editingExistingId);
-    if (idx>=0) next.batches[idx] = b; else next.batches.push(b);
+    const idx = topic.batches.findIndex(x=>x.id===APP.editingExistingId);
+    if (idx>=0) topic.batches[idx] = b; else topic.batches.push(b);
   } else {
     if (!b.createdAt) b.createdAt = new Date().toISOString();
-    next.batches.push(b);
+    topic.batches.push(b);
   }
   next.meta.updatedAt = new Date().toISOString();
   const ok = await publishState(next);
   APP.saving = false;
-  if (ok){ APP.wizardOpen = false; APP.wizardBatch = null; showToast('บันทึกชุดกิจกรรมสำเร็จ','success'); }
+  if (ok){ APP.wizardOpen = false; APP.wizardBatch = null; APP.wizardTopicId = null; showToast('บันทึกแบบเกียรติบัตรสำเร็จ','success'); }
   render();
 }
 
 function deleteBatch(batchId){
-  const b = APP.state.batches.find(x=>x.id===batchId);
-  if (!b) return;
+  const found = findBatchGlobal(batchId);
+  if (!found) return;
+  const { topic, batch:b } = found;
   showConfirmModal(
-    'ลบชุดกิจกรรม "'+b.name+'" และเกียรติบัตรทั้งหมด ('+b.recipients.length+' รายชื่อ) ใช่หรือไม่? การลบไม่สามารถย้อนกลับได้',
+    'ลบแบบ "'+b.name+'" และเกียรติบัตรทั้งหมด ('+b.recipients.length+' รายชื่อ) ใช่หรือไม่? การลบไม่สามารถย้อนกลับได้',
     async ()=>{
       const next = JSON.parse(JSON.stringify(APP.state));
-      next.batches = next.batches.filter(x=>x.id!==batchId);
+      const t = next.topics.find(x=>x.id===topic.id);
+      if (t) t.batches = t.batches.filter(x=>x.id!==batchId);
       next.meta.updatedAt = new Date().toISOString();
       const ok = await publishState(next);
-      if (ok) showToast('ลบชุดกิจกรรมแล้ว','success');
+      if (ok) showToast('ลบแบบเกียรติบัตรแล้ว','success');
+      render();
+    },
+    'ลบเลย'
+  );
+}
+
+function showTopicModal(existingTopicId){
+  const t = existingTopicId ? APP.state.topics.find(x=>x.id===existingTopicId) : null;
+  APP.topicModalEditId = existingTopicId || null;
+  const root = document.getElementById('modal-root');
+  root.innerHTML =
+    '<div class="modal-backdrop" data-close-modal>'+
+      '<div class="modal" role="dialog" aria-modal="true" aria-label="'+(t?'แก้ไขชื่อหัวข้อ':'สร้างหัวข้อใหม่')+'">'+
+        '<h3>'+(t?'แก้ไขชื่อหัวข้อ':'สร้างหัวข้อใหม่')+'</h3>'+
+        '<div class="field" style="margin-top:12px;">'+
+          '<label for="topic-modal-name">ชื่อหัวข้อ</label>'+
+          '<input type="text" id="topic-modal-name" placeholder="เช่น เกียรติบัตรสัปดาห์วันวิทยาศาสตร์ ประจำปี 2569" value="'+escapeHtml(t?t.name:'')+'" autocomplete="off">'+
+          (t ? '' : '<div class="help">สร้างแล้วจะไปหน้าเพิ่ม “แบบ” เกียรติบัตรแรกของหัวข้อนี้ต่อทันที</div>')+
+        '</div>'+
+        '<div style="display:flex; gap:8px; margin-top:16px;">'+
+          '<button type="button" class="btn btn-ghost" style="flex:1;" data-close-modal>ยกเลิก</button>'+
+          '<button type="button" class="btn btn-primary" style="flex:1;" data-action="save-topic-modal">บันทึก</button>'+
+        '</div>'+
+      '</div>'+
+    '</div>';
+  setTimeout(()=>{ const inp = document.getElementById('topic-modal-name'); if (inp){ inp.focus(); inp.select(); } }, 30);
+}
+
+async function saveTopicModal(){
+  const inp = document.getElementById('topic-modal-name');
+  const name = inp ? inp.value.trim() : '';
+  if (!name){ showToast('กรุณาตั้งชื่อหัวข้อ','error'); return; }
+  const next = JSON.parse(JSON.stringify(APP.state));
+  const isNew = !APP.topicModalEditId;
+  let newTopicId = null;
+  if (isNew){
+    newTopicId = uid('topic');
+    next.topics.push({ id: newTopicId, name, createdAt: new Date().toISOString(), batches: [] });
+  } else {
+    const t = next.topics.find(x=>x.id===APP.topicModalEditId);
+    if (t) t.name = name;
+  }
+  next.meta.updatedAt = new Date().toISOString();
+  const ok = await publishState(next);
+  if (ok){
+    closeModal();
+    showToast(isNew ? 'สร้างหัวข้อใหม่สำเร็จ' : 'บันทึกชื่อหัวข้อสำเร็จ', 'success');
+    if (isNew){
+      APP.adminTopicId = newTopicId;
+      location.hash = '#admin/topic/'+encodeURIComponent(newTopicId);
+    }
+    render();
+  }
+}
+
+function deleteTopic(topicId){
+  const t = APP.state.topics.find(x=>x.id===topicId);
+  if (!t) return;
+  const totalR = t.batches.reduce((n,b)=>n+b.recipients.length,0);
+  const detail = t.batches.length ? (' (มี '+t.batches.length+' แบบ รวม '+totalR+' รายชื่อ)') : '';
+  showConfirmModal(
+    'ลบหัวข้อ "'+t.name+'"'+detail+' ใช่หรือไม่? การลบไม่สามารถย้อนกลับได้',
+    async ()=>{
+      const next = JSON.parse(JSON.stringify(APP.state));
+      next.topics = next.topics.filter(x=>x.id!==topicId);
+      next.meta.updatedAt = new Date().toISOString();
+      const ok = await publishState(next);
+      if (ok){ showToast('ลบหัวข้อแล้ว','success'); APP.adminTopicId = null; location.hash = '#admin'; }
       render();
     },
     'ลบเลย'
@@ -1489,7 +1693,7 @@ async function publishState(newState){
       showToast('คุณไม่มีสิทธิ์บันทึกการเปลี่ยนแปลง (เฉพาะเจ้าของระบบเท่านั้น)','error');
       return false;
     }
-    if (code==='too_large'){ showToast('ข้อมูลมีขนาดใหญ่เกินไป กรุณาลดขนาดรูปแม่แบบหรือลบชุดกิจกรรมเก่าออกบ้าง','error'); return false; }
+    if (code==='too_large'){ showToast('ข้อมูลมีขนาดใหญ่เกินไป กรุณาลดขนาดรูปแม่แบบหรือลบแบบเกียรติบัตรเก่าออกบ้าง','error'); return false; }
     if (code==='rate_limited'){ showToast('บันทึกถี่เกินไป กรุณารอสักครู่แล้วลองใหม่','error'); return false; }
     showToast('บันทึกไม่สำเร็จ: '+(err && err.message ? err.message : 'ข้อผิดพลาดไม่ทราบสาเหตุ'),'error');
     return false;
@@ -1695,7 +1899,8 @@ function onGlobalClick(e){
   const navBtn = e.target.closest('[data-nav]');
   if (navBtn){
     APP.view = navBtn.dataset.nav;
-    if (APP.view === 'search'){ APP.selectedTopicId = null; APP.query = ''; }
+    if (APP.view === 'search'){ APP.selectedTopicId = null; APP.selectedItemId = null; APP.query = ''; }
+    if (APP.view === 'admin'){ APP.adminTopicId = null; APP.wizardOpen = false; APP.wizardBatch = null; APP.wizardTopicId = null; }
     location.hash = APP.view==='admin' ? '#admin' : '';
     render();
     return;
@@ -1705,21 +1910,56 @@ function onGlobalClick(e){
   if (actionEl){
     const action = actionEl.dataset.action;
     if (action==='select-topic'){
-      APP.selectedTopicId = actionEl.dataset.batch;
+      const topicId = actionEl.dataset.topic;
+      const topic = APP.state.topics.find(t=>t.id===topicId);
+      APP.selectedTopicId = topicId;
       APP.query = '';
-      location.hash = '#topic/' + encodeURIComponent(APP.selectedTopicId);
+      if (topic && topic.batches.length === 1){
+        APP.selectedItemId = topic.batches[0].id;
+        location.hash = '#topic/'+encodeURIComponent(topicId)+'/item/'+encodeURIComponent(APP.selectedItemId);
+      } else {
+        APP.selectedItemId = null;
+        location.hash = '#topic/'+encodeURIComponent(topicId);
+      }
+      render();
+    }
+    else if (action==='select-item'){
+      APP.selectedItemId = actionEl.dataset.batch;
+      APP.query = '';
+      location.hash = '#topic/'+encodeURIComponent(APP.selectedTopicId)+'/item/'+encodeURIComponent(APP.selectedItemId);
+      render();
+    }
+    else if (action==='back-to-items'){
+      APP.selectedItemId = null;
+      APP.query = '';
+      location.hash = '#topic/'+encodeURIComponent(APP.selectedTopicId);
       render();
     }
     else if (action==='back-to-topics'){
       APP.selectedTopicId = null;
+      APP.selectedItemId = null;
       APP.query = '';
       location.hash = '';
       render();
     }
+    else if (action==='open-admin-topic'){
+      APP.adminTopicId = actionEl.dataset.topic;
+      location.hash = '#admin/topic/'+encodeURIComponent(APP.adminTopicId);
+      render();
+    }
+    else if (action==='admin-back-to-topics'){
+      APP.adminTopicId = null;
+      location.hash = '#admin';
+      render();
+    }
+    else if (action==='open-topic-modal') showTopicModal(null);
+    else if (action==='rename-topic') showTopicModal(actionEl.dataset.topic);
+    else if (action==='save-topic-modal') saveTopicModal();
+    else if (action==='delete-topic') deleteTopic(actionEl.dataset.topic);
     else if (action==='preview-cert') showCertPreview(actionEl.dataset.batch, actionEl.dataset.recipient);
     else if (action==='download-pdf') exportCertificate(actionEl.dataset.batch, actionEl.dataset.recipient, 'pdf');
     else if (action==='download-png') exportCertificate(actionEl.dataset.batch, actionEl.dataset.recipient, 'png');
-    else if (action==='open-wizard') openWizardNew();
+    else if (action==='open-wizard') openWizardNew(actionEl.dataset.topic);
     else if (action==='edit-batch') openWizardEdit(actionEl.dataset.batch);
     else if (action==='delete-batch') deleteBatch(actionEl.dataset.batch);
     else if (action==='export-backup') exportBackup();
@@ -1727,7 +1967,7 @@ function onGlobalClick(e){
       const b = APP.wizardBatch;
       const hasData = b && (b.name.trim() || b.template || b.recipients.length);
       if (!hasData) closeWizard();
-      else showConfirmModal('ยกเลิกการสร้าง/แก้ไขชุดกิจกรรมนี้? ข้อมูลที่กรอกไว้จะหายไป', ()=>closeWizard(), 'ยกเลิกรายการนี้');
+      else showConfirmModal('ยกเลิกการสร้าง/แก้ไขแบบเกียรติบัตรนี้? ข้อมูลที่กรอกไว้จะหายไป', ()=>closeWizard(), 'ยกเลิกรายการนี้');
     }
     else if (action==='confirm-yes'){ const fn = pendingConfirmAction; closeModal(); if (fn) fn(); }
     else if (action==='wizard-back') wizardBack();
@@ -1772,7 +2012,7 @@ async function runDiagnostics(){
     lines.push('document.fonts exists: ' + !!(document.fonts));
     lines.push('document.fonts.check exists: ' + !!(document.fonts && document.fonts.check));
 
-    const batch = APP.state.batches[0];
+    const batch = allBatches()[0];
     const recipient = (batch && (batch.recipients.find(r=>r.certNo==='5229') || batch.recipients[0])) || null;
     if (!batch || !recipient){
       lines.push('--- no batch/recipient data to test ---');
@@ -1836,7 +2076,7 @@ async function runDiagnostics(){
   wrap.appendChild(pre);
 
   try{
-    const batch2 = APP.state.batches[0];
+    const batch2 = allBatches()[0];
     const recipient2 = (batch2 && (batch2.recipients.find(r=>r.certNo==='5229') || batch2.recipients[0])) || null;
     if (batch2 && recipient2){
       const label = document.createElement('div');
@@ -1868,9 +2108,11 @@ function init(){
   document.addEventListener('click', onGlobalClick);
   window.addEventListener('hashchange', ()=>{
     const route = parseHashRoute();
-    if (route.view !== APP.view || route.topicId !== APP.selectedTopicId){
+    if (route.view !== APP.view || route.topicId !== APP.selectedTopicId || route.itemId !== APP.selectedItemId || route.adminTopicId !== APP.adminTopicId){
       APP.view = route.view;
+      APP.adminTopicId = route.adminTopicId;
       APP.selectedTopicId = route.topicId;
+      APP.selectedItemId = route.itemId;
       render();
     }
   });
