@@ -631,23 +631,56 @@ async function renderCertificateCanvas(batch, values){
       const ascent = hasBounds ? m.actualBoundingBoxAscent : f.fontSizePx * 0.72;
       const descent = hasBounds ? m.actualBoundingBoxDescent : f.fontSizePx * 0.22;
       const baselineY = lineCenterY + (ascent - descent) / 2;
-      // Final safety net: on real Safari, ctx.measureText() has been confirmed
-      // (via on-device diagnostics) to sometimes report a NARROWER width than
-      // what fillText() actually paints — so m.width above cannot be trusted to
-      // decide whether a line fits. Measure the real painted pixels instead and
-      // clamp against that, so a line can never silently run off the certificate
-      // regardless of which engine's measureText() is lying.
-      const paintedWidth = maxW ? measureActualPaintedWidth(line, fontSpec, f.fontSizePx) : null;
-      const effectiveWidth = (typeof paintedWidth === 'number') ? paintedWidth : m.width;
-      if (maxW && effectiveWidth > maxW){
-        const scale = maxW / effectiveWidth;
+
+      // Paint at full scale first — this is what actually ships unless the
+      // verification below finds it doesn't fit.
+      ctx.fillText(line, x, baselineY);
+      if (!maxW) return;
+
+      // Final safety net, checked against reality instead of any prediction:
+      // on real Safari, ctx.measureText() has been confirmed (via on-device
+      // diagnostics) to sometimes report a NARROWER width than what fillText()
+      // actually paints — and a separate scratch-canvas measurement can still
+      // disagree with THIS canvas if a browser rasterizes/hints a font
+      // differently per <canvas> element. So instead of predicting, inspect
+      // the literal pixels just painted on this exact canvas: if the real ink
+      // still overflows maxW, erase just that line (by restoring the original
+      // template artwork under it) and repaint it horizontally compressed to
+      // fit. This can never be fooled by an engine's measureText() quirk,
+      // because it never trusts measureText() for the final decision at all.
+      const bandTop = Math.max(0, Math.floor(lineCenterY - lineHeight/2));
+      const bandHeight = Math.min(canvas.height - bandTop, Math.ceil(lineHeight));
+      if (bandHeight <= 0) return;
+      let bounds = null;
+      try{
+        const band = ctx.getImageData(0, bandTop, canvas.width, bandHeight).data;
+        const w = canvas.width;
+        let minX = -1, maxX = -1;
+        for (let px=0; px<w; px++){
+          let inked = false;
+          for (let py=0; py<bandHeight; py++){
+            if (band[(py*w+px)*4+3] > 10){ inked = true; break; }
+          }
+          if (inked){ if (minX<0) minX = px; maxX = px; }
+        }
+        if (minX >= 0) bounds = { minX, maxX, width: maxX - minX + 1 };
+      }catch(e){ /* e.g. tainted canvas in some odd embedding — can't verify, leave as painted */ }
+
+      if (bounds && bounds.width > maxW + 1){
+        const pad = 4;
+        const rectX = Math.max(0, bounds.minX - pad);
+        const rectX2 = Math.min(canvas.width, bounds.maxX + pad + 1);
+        const rectW = rectX2 - rectX;
+        // Restore the original certificate artwork under just this line's ink
+        // (source and destination rects match 1:1 — canvas.width/height were
+        // set directly from img.naturalWidth/height above) before repainting.
+        ctx.drawImage(img, rectX, bandTop, rectW, bandHeight, rectX, bandTop, rectW, bandHeight);
+        const scale = maxW / bounds.width;
         ctx.save();
         ctx.translate(x, baselineY);
         ctx.scale(scale, 1);
         ctx.fillText(line, 0, 0);
         ctx.restore();
-      } else {
-        ctx.fillText(line, x, baselineY);
       }
     });
   }
