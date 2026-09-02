@@ -219,6 +219,33 @@
   }
   .new-batch-tile:hover{background:var(--surface-2); color:var(--ink);}
 
+  .topic-grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:16px; margin-top:18px;}
+  .topic-card{
+    border:1px solid var(--border); border-radius:var(--radius-l); background:var(--surface);
+    box-shadow:var(--shadow); overflow:hidden; cursor:pointer; text-align:left;
+    display:flex; flex-direction:column; padding:0; font:inherit; color:inherit;
+    transition:transform .15s ease, box-shadow .15s ease; width:100%;
+  }
+  .topic-card:hover{transform:translateY(-2px); box-shadow:0 4px 10px rgba(27,35,64,.08), 0 16px 32px -14px rgba(27,35,64,.24);}
+  .topic-card:focus-visible{outline:2px solid var(--accent); outline-offset:2px;}
+  .topic-card .thumb{width:100%; aspect-ratio:1.6; background:var(--surface-3); border-bottom:1px solid var(--border); overflow:hidden;}
+  .topic-card .thumb img{width:100%; height:100%; object-fit:cover; display:block;}
+  .topic-card .thumb.empty{display:flex; align-items:center; justify-content:center; color:var(--ink-faint);}
+  .topic-card .thumb.empty .icon{width:26px; height:26px;}
+  .topic-card .body{padding:16px 18px 18px; display:flex; flex-direction:column; gap:6px; flex:1;}
+  .topic-card .eyebrow-tag{font-size:10.5px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--gold);}
+  .topic-card .title{font-family:'Kanit','IBM Plex Sans Thai',sans-serif; font-weight:600; font-size:16px; color:var(--ink); line-height:1.4;}
+  .topic-card .count{font-size:12.5px; color:var(--ink-faint); margin-top:auto; padding-top:8px;}
+  .topic-card .cta{display:inline-flex; align-items:center; gap:4px; font-size:13px; font-weight:600; color:var(--accent); margin-top:2px;}
+  .topic-card .cta .icon{width:14px; height:14px;}
+
+  .back-link{
+    display:inline-flex; align-items:center; gap:5px; font-size:13px; font-weight:500; color:var(--ink-soft);
+    background:none; border:none; cursor:pointer; padding:6px 2px; margin-bottom:10px; font-family:inherit;
+  }
+  .back-link:hover{color:var(--ink);}
+  .back-link .icon{width:15px; height:15px;}
+
   .wizard{margin-top:20px; border:1px solid var(--border); border-radius:var(--radius-l); padding:24px; background:var(--surface-2);}
   .wizard-steps{display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap;}
   .wizard-steps span{font-size:11.5px; padding:5px 11px; border-radius:999px; background:var(--surface-3); color:var(--ink-faint); font-weight:600;}
@@ -435,9 +462,19 @@ function loadInitialState(){
   return defaultState();
 }
 
+function parseHashRoute(){
+  const h = location.hash || '';
+  if (h === '#admin') return { view:'admin', topicId:null };
+  const m = h.match(/^#topic\/(.+)$/);
+  if (m) return { view:'search', topicId: decodeURIComponent(m[1]) };
+  return { view:'search', topicId:null };
+}
+const _initialRoute = parseHashRoute();
+
 const APP = {
   state: loadInitialState(),
-  view: (location.hash === '#admin') ? 'admin' : 'search',
+  view: _initialRoute.view,
+  selectedTopicId: _initialRoute.topicId,
   query: '',
   writable: !isExternalHost(), // optimistic on Claude; on an external host (e.g. GitHub Pages) there is no save backend at all
   wizardOpen: false,
@@ -489,11 +526,12 @@ function showToast(msg, type){
   setTimeout(()=>{ el.style.opacity='0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),320); }, 4200);
 }
 /* ============================== SEARCH ============================== */
-function searchRecipients(query){
+function searchRecipients(query, batchId){
   const q = normalizeName(stripTitle(query));
   if (!q) return [];
   const out = [];
-  for (const batch of APP.state.batches){
+  const batches = batchId ? APP.state.batches.filter(b=>b.id===batchId) : APP.state.batches;
+  for (const batch of batches){
     for (const r of batch.recipients){
       const name = normalizeName(stripTitle(r.name));
       const idx = name.indexOf(q);
@@ -804,21 +842,62 @@ function render(){
 }
 
 /* ============================== RENDER: SEARCH ============================== */
+function currentTopic(){
+  return APP.selectedTopicId ? APP.state.batches.find(b=>b.id===APP.selectedTopicId) : null;
+}
+
 function renderSearchView(){
-  const results = APP.query.trim() ? searchRecipients(APP.query) : [];
-  const batchCount = APP.state.batches.length;
+  const topic = currentTopic();
+  return topic ? renderTopicSearchView(topic) : renderTopicListView();
+}
+
+function renderTopicListView(){
+  const topics = APP.state.batches;
   return ''+
   '<section class="card search-panel">'+
-    '<div class="eyebrow">ค้นหาชื่อของท่าน</div>'+
+    '<div class="eyebrow">เลือกหัวข้อ/กิจกรรม</div>'+
     '<h2>ดาวน์โหลดเกียรติบัตรของคุณ</h2>'+
-    '<p class="desc">พิมพ์ชื่อ-นามสกุล (หรือเพียงบางส่วน) เพื่อค้นหาเกียรติบัตรจากทุกกิจกรรมที่มีในระบบ</p>'+
+    '<p class="desc">เลือกหัวข้อของกิจกรรมที่ท่านเข้าร่วม จากนั้นค้นหาชื่อของท่านเพื่อดาวน์โหลดเกียรติบัตร</p>'+
+    '<div class="stat-strip">'+
+      '<div class="stat"><span class="n mono">'+topics.length+'</span><span class="l">หัวข้อทั้งหมด</span></div>'+
+      '<div class="stat"><span class="n mono">'+totalRecipients()+'</span><span class="l">เกียรติบัตรพร้อมดาวน์โหลด</span></div>'+
+    '</div>'+
+  '</section>'+
+  '<section class="section-gap">'+ renderTopicGrid(topics) +'</section>';
+}
+
+function renderTopicGrid(topics){
+  if (!topics.length){
+    return '<div class="empty-state">ยังไม่มีหัวข้อกิจกรรมในระบบ กรุณารอผู้ดูแลระบบเพิ่มข้อมูล</div>';
+  }
+  const cards = topics.map(b=>''+
+    '<button type="button" class="topic-card" data-action="select-topic" data-batch="'+b.id+'" aria-label="เข้าดูหัวข้อ '+escapeHtml(b.name)+'">'+
+      '<div class="thumb'+(b.template && b.template.dataUrl ? '' : ' empty')+'">'+(b.template && b.template.dataUrl ? '<img src="'+b.template.dataUrl+'" alt="">' : searchIcon())+'</div>'+
+      '<div class="body">'+
+        '<div class="eyebrow-tag">หัวข้อย่อย</div>'+
+        '<div class="title">'+escapeHtml(b.name)+'</div>'+
+        '<div class="count">'+b.recipients.length+' เกียรติบัตร</div>'+
+        '<div class="cta">ค้นหาเกียรติบัตร '+chevronRightIcon()+'</div>'+
+      '</div>'+
+    '</button>'
+  ).join('');
+  return '<div class="topic-grid">'+cards+'</div>';
+}
+
+function renderTopicSearchView(batch){
+  const results = APP.query.trim() ? searchRecipients(APP.query, batch.id) : [];
+  return ''+
+  '<button type="button" class="back-link" data-action="back-to-topics">'+backIcon()+' หัวข้อทั้งหมด</button>'+
+  '<section class="card search-panel">'+
+    '<div class="eyebrow">'+escapeHtml(batch.name)+'</div>'+
+    '<h2>ดาวน์โหลดเกียรติบัตรของคุณ</h2>'+
+    '<p class="desc">พิมพ์ชื่อ-นามสกุล (หรือเพียงบางส่วน) เพื่อค้นหาเกียรติบัตรในหัวข้อนี้</p>'+
     '<form id="search-form" class="search-form">'+
-      '<input type="text" id="search-input" placeholder="เช่น สมชาย ใจดี" value="'+escapeHtml(APP.query)+'" autocomplete="off" aria-label="ค้นหาชื่อ-นามสกุล">'+
+      '<input type="text" id="search-input" placeholder="เช่น สมชาย ใจดี" value="'+escapeHtml(APP.query)+'" autocomplete="off" aria-label="ค้นหาชื่อ-นามสกุล" autofocus>'+
       '<button type="submit" class="btn btn-primary">'+searchIcon()+' ค้นหา</button>'+
     '</form>'+
     '<div class="stat-strip">'+
-      '<div class="stat"><span class="n mono">'+batchCount+'</span><span class="l">ชุดกิจกรรม</span></div>'+
-      '<div class="stat"><span class="n mono">'+totalRecipients()+'</span><span class="l">เกียรติบัตรพร้อมดาวน์โหลด</span></div>'+
+      '<div class="stat"><span class="n mono">'+batch.recipients.length+'</span><span class="l">เกียรติบัตรในหัวข้อนี้</span></div>'+
     '</div>'+
   '</section>'+
   '<section class="section-gap" id="search-results-section">'+ renderSearchResults(results) +'</section>';
@@ -827,13 +906,15 @@ function renderSearchView(){
 function updateSearchResultsOnly(){
   const el = document.getElementById('search-results-section');
   if (!el) return;
-  el.innerHTML = renderSearchResults(APP.query.trim() ? searchRecipients(APP.query) : []);
+  const topic = currentTopic();
+  const results = (topic && APP.query.trim()) ? searchRecipients(APP.query, topic.id) : [];
+  el.innerHTML = renderSearchResults(results);
 }
 
 function renderSearchResults(results){
   if (!APP.query.trim()){
     if (!APP.state.batches.length){
-      return '<div class="empty-state">ยังไม่มีชุดกิจกรรมในระบบ กรุณารอผู้ดูแลระบบเพิ่มข้อมูล</div>';
+      return '<div class="empty-state">ยังไม่มีหัวข้อกิจกรรมในระบบ กรุณารอผู้ดูแลระบบเพิ่มข้อมูล</div>';
     }
     return '';
   }
@@ -850,7 +931,7 @@ function resultCardHtml(item){
     '<div class="result-thumb">'+ (b.template && b.template.dataUrl ? '<img src="'+b.template.dataUrl+'" alt="">' : '') +'</div>'+
     '<div class="result-info">'+
       '<div class="name">'+escapeHtml(r.name)+'</div>'+
-      '<div class="meta">'+escapeHtml(b.name)+ (r.note ? ' · '+escapeHtml(r.note) : '') + (r.certNo ? ' · เลขที่ '+escapeHtml(r.certNo) : '') +'</div>'+
+      '<div class="meta">'+(r.note ? escapeHtml(r.note) : '') + (r.certNo ? (r.note ? ' · ' : '') + 'เลขที่ '+escapeHtml(r.certNo) : '') +'</div>'+
     '</div>'+
     '<div class="result-actions">'+
       '<button type="button" class="btn btn-ghost btn-sm" data-action="preview-cert" data-batch="'+b.id+'" data-recipient="'+r.id+'">ดูตัวอย่าง</button>'+
@@ -906,6 +987,8 @@ function showConfirmModal(message, onConfirm, confirmLabel){
 function searchIcon(){ return '<svg class="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="9" cy="9" r="6.2"/><path d="M17 17l-3.8-3.8" stroke-linecap="round"/></svg>'; }
 function downloadIcon(){ return '<svg class="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 3v10m0 0l-3.6-3.6M10 13l3.6-3.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15.5v1a1.5 1.5 0 001.5 1.5h9a1.5 1.5 0 001.5-1.5v-1" stroke-linecap="round"/></svg>'; }
 function plusIcon(){ return '<svg class="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 4v12M4 10h12" stroke-linecap="round"/></svg>'; }
+function backIcon(){ return '<svg class="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12.5 4.5L6 10l6.5 5.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'; }
+function chevronRightIcon(){ return '<svg class="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7.5 4.5L14 10l-6.5 5.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'; }
 function trashIcon(){ return '<svg class="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4.5 6h11M8 6V4.5h4V6M6 6l.7 9.3A1 1 0 007.7 16h4.6a1 1 0 001-.9L14 6" stroke-linecap="round" stroke-linejoin="round"/></svg>'; }
 /* ============================== RENDER: ADMIN ============================== */
 function newWizardBatch(){
@@ -1612,6 +1695,7 @@ function onGlobalClick(e){
   const navBtn = e.target.closest('[data-nav]');
   if (navBtn){
     APP.view = navBtn.dataset.nav;
+    if (APP.view === 'search'){ APP.selectedTopicId = null; APP.query = ''; }
     location.hash = APP.view==='admin' ? '#admin' : '';
     render();
     return;
@@ -1620,7 +1704,19 @@ function onGlobalClick(e){
   const actionEl = e.target.closest('[data-action]');
   if (actionEl){
     const action = actionEl.dataset.action;
-    if (action==='preview-cert') showCertPreview(actionEl.dataset.batch, actionEl.dataset.recipient);
+    if (action==='select-topic'){
+      APP.selectedTopicId = actionEl.dataset.batch;
+      APP.query = '';
+      location.hash = '#topic/' + encodeURIComponent(APP.selectedTopicId);
+      render();
+    }
+    else if (action==='back-to-topics'){
+      APP.selectedTopicId = null;
+      APP.query = '';
+      location.hash = '';
+      render();
+    }
+    else if (action==='preview-cert') showCertPreview(actionEl.dataset.batch, actionEl.dataset.recipient);
     else if (action==='download-pdf') exportCertificate(actionEl.dataset.batch, actionEl.dataset.recipient, 'pdf');
     else if (action==='download-png') exportCertificate(actionEl.dataset.batch, actionEl.dataset.recipient, 'png');
     else if (action==='open-wizard') openWizardNew();
@@ -1771,8 +1867,12 @@ async function runDiagnostics(){
 function init(){
   document.addEventListener('click', onGlobalClick);
   window.addEventListener('hashchange', ()=>{
-    const v = location.hash === '#admin' ? 'admin' : 'search';
-    if (v !== APP.view){ APP.view = v; render(); }
+    const route = parseHashRoute();
+    if (route.view !== APP.view || route.topicId !== APP.selectedTopicId){
+      APP.view = route.view;
+      APP.selectedTopicId = route.topicId;
+      render();
+    }
   });
   document.addEventListener('keydown', e=>{ if (e.key==='Escape') closeModal(); });
   render();
