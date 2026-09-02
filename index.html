@@ -211,8 +211,6 @@
   .batch-card{border:1px solid var(--border); border-radius:var(--radius-m); background:var(--surface-2); padding:14px; display:flex; flex-direction:column; gap:10px;}
   .batch-card .thumb{width:100%; aspect-ratio:1.6; border-radius:8px; overflow:hidden; background:var(--surface-3); border:1px solid var(--border);}
   .batch-card .thumb img{width:100%; height:100%; object-fit:cover; display:block;}
-  .batch-card .icon-tile{aspect-ratio:1.6; border-radius:8px; border:1px solid var(--border);}
-  .batch-card .icon-tile span{font-size:30px;}
   .batch-card .topic-tag{font-size:10px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--gold); margin-bottom:1px;}
   .batch-card .name{font-weight:600; font-size:14.5px; line-height:1.4;}
   .batch-card .count{font-size:12px; color:var(--ink-faint);}
@@ -237,11 +235,6 @@
   .topic-card .thumb img{width:100%; height:100%; object-fit:cover; display:block;}
   .topic-card .thumb.empty{display:flex; align-items:center; justify-content:center; color:var(--ink-faint);}
   .topic-card .thumb.empty .icon{width:26px; height:26px;}
-  .icon-tile{
-    width:100%; aspect-ratio:2.4; background:linear-gradient(160deg, var(--surface-2), var(--surface-3));
-    border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:center;
-  }
-  .icon-tile span{font-size:40px; line-height:1;}
   .topic-card .body{padding:16px 18px 18px; display:flex; flex-direction:column; gap:6px; flex:1;}
   .topic-card .eyebrow-tag{font-size:10.5px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--gold);}
   .topic-card .title{font-family:'Kanit','IBM Plex Sans Thai',sans-serif; font-weight:600; font-size:16px; color:var(--ink); line-height:1.4;}
@@ -270,14 +263,6 @@
   .field textarea{min-height:120px; resize:vertical; font-family:'IBM Plex Mono',monospace; font-size:13px;}
   .field input:focus, .field select:focus, .field textarea:focus{border-color:var(--accent);}
   .field .help{font-size:12px; color:var(--ink-faint); margin-top:5px;}
-  .icon-pick-grid{display:flex; flex-wrap:wrap; gap:8px;}
-  .icon-pick{
-    width:42px; height:42px; border-radius:var(--radius-s); border:1.5px solid var(--border);
-    background:var(--surface-2); font-size:20px; line-height:1; cursor:pointer;
-    display:flex; align-items:center; justify-content:center; transition:border-color .15s, background .15s;
-  }
-  .icon-pick:hover{background:var(--surface-3);}
-  .icon-pick.selected{border-color:var(--accent); background:var(--surface); box-shadow:0 0 0 2px var(--accent) inset;}
   .grid-2{display:grid; grid-template-columns:1fr 1fr; gap:14px;}
   @media (max-width:560px){.grid-2{grid-template-columns:1fr;}}
   .dropzone{
@@ -453,8 +438,6 @@ function ensureWizardSample(b){
   };
 }
 const TITLE_PREFIXES = ['เด็กชาย','เด็กหญิง','นางสาว','นาย','นาง','ดร.','ผศ.','รศ.','ศ.','Mr.','Mrs.','Ms.'];
-const TOPIC_ICON_PRESETS = ['📜','🏫','🔬','📚','🎨','🏆','🎓','🎭','⚽','🎉','🌟','💡','🔭','🎵','🖊️','🌐'];
-const DEFAULT_TOPIC_ICON = '📜';
 
 function uid(prefix){ return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
 
@@ -476,7 +459,6 @@ function loadInitialState(){
       if (Array.isArray(parsed.topics)){
         parsed.topics.forEach(t=>{
           if (!Array.isArray(t.batches)) t.batches = [];
-          if (!t.icon) t.icon = DEFAULT_TOPIC_ICON;
           t.batches.forEach(migrateBatchFields);
         });
         return parsed;
@@ -487,7 +469,6 @@ function loadInitialState(){
           return {
             id: uid('topic'),
             name: b.name,
-            icon: DEFAULT_TOPIC_ICON,
             createdAt: b.createdAt,
             batches: [ Object.assign({}, b, { name: 'แบบที่ 1' }) ]
           };
@@ -939,10 +920,11 @@ function renderTopicGrid(topics){
   }
   const cards = topics.map(t=>{
     const totalR = t.batches.reduce((n,b)=>n+b.recipients.length,0);
+    const thumbBatch = t.batches.find(b=>b.template && b.template.dataUrl);
     const countLabel = t.batches.length>1 ? (t.batches.length+' แบบ · '+totalR+' เกียรติบัตร') : (totalR+' เกียรติบัตร');
     return ''+
     '<button type="button" class="topic-card" data-action="select-topic" data-topic="'+t.id+'" aria-label="เข้าดูหัวข้อ '+escapeHtml(t.name)+'">'+
-      '<div class="icon-tile"><span>'+escapeHtml(t.icon||DEFAULT_TOPIC_ICON)+'</span></div>'+
+      '<div class="thumb'+(thumbBatch ? '' : ' empty')+'">'+(thumbBatch ? '<img src="'+thumbBatch.template.dataUrl+'" alt="">' : searchIcon())+'</div>'+
       '<div class="body">'+
         '<div class="eyebrow-tag">หัวข้อย่อย</div>'+
         '<div class="title">'+escapeHtml(t.name)+'</div>'+
@@ -1154,9 +1136,10 @@ function renderAdminTopicsGrid(){
   }
   const cards = topics.map(t=>{
     const totalR = t.batches.reduce((n,b)=>n+b.recipients.length,0);
+    const thumbBatch = t.batches.find(b=>b.template && b.template.dataUrl);
     return ''+
     '<div class="batch-card" data-action="open-admin-topic" data-topic="'+t.id+'" style="cursor:pointer;">'+
-      '<div class="icon-tile"><span>'+escapeHtml(t.icon||DEFAULT_TOPIC_ICON)+'</span></div>'+
+      '<div class="thumb">'+(thumbBatch ? '<img src="'+thumbBatch.template.dataUrl+'" alt="">' : '')+'</div>'+
       '<div class="topic-tag">หัวข้อ</div>'+
       '<div class="name">'+escapeHtml(t.name)+'</div>'+
       '<div class="count">'+t.batches.length+' แบบ · '+totalR+' รายชื่อ</div>'+
@@ -1593,10 +1576,6 @@ function deleteBatch(batchId){
 function showTopicModal(existingTopicId){
   const t = existingTopicId ? APP.state.topics.find(x=>x.id===existingTopicId) : null;
   APP.topicModalEditId = existingTopicId || null;
-  const currentIcon = (t && t.icon) || DEFAULT_TOPIC_ICON;
-  const iconPicksHtml = TOPIC_ICON_PRESETS.map(ic=>
-    '<button type="button" class="icon-pick'+(ic===currentIcon?' selected':'')+'" data-action="pick-topic-icon" data-icon="'+ic+'" aria-label="เลือกไอคอน '+ic+'">'+ic+'</button>'
-  ).join('');
   const root = document.getElementById('modal-root');
   root.innerHTML =
     '<div class="modal-backdrop" data-close-modal>'+
@@ -1606,11 +1585,6 @@ function showTopicModal(existingTopicId){
           '<label for="topic-modal-name">ชื่อหัวข้อ</label>'+
           '<input type="text" id="topic-modal-name" placeholder="เช่น เกียรติบัตรสัปดาห์วันวิทยาศาสตร์ ประจำปี 2569" value="'+escapeHtml(t?t.name:'')+'" autocomplete="off">'+
           (t ? '' : '<div class="help">สร้างแล้วจะไปหน้าเพิ่ม “แบบ” เกียรติบัตรแรกของหัวข้อนี้ต่อทันที</div>')+
-        '</div>'+
-        '<div class="field">'+
-          '<label>ไอคอนหัวข้อ</label>'+
-          '<div class="icon-pick-grid">'+iconPicksHtml+'</div>'+
-          '<input type="hidden" id="topic-modal-icon" value="'+currentIcon+'">'+
         '</div>'+
         '<div style="display:flex; gap:8px; margin-top:16px;">'+
           '<button type="button" class="btn btn-ghost" style="flex:1;" data-close-modal>ยกเลิก</button>'+
@@ -1625,17 +1599,15 @@ async function saveTopicModal(){
   const inp = document.getElementById('topic-modal-name');
   const name = inp ? inp.value.trim() : '';
   if (!name){ showToast('กรุณาตั้งชื่อหัวข้อ','error'); return; }
-  const iconInp = document.getElementById('topic-modal-icon');
-  const icon = (iconInp && iconInp.value) || DEFAULT_TOPIC_ICON;
   const next = JSON.parse(JSON.stringify(APP.state));
   const isNew = !APP.topicModalEditId;
   let newTopicId = null;
   if (isNew){
     newTopicId = uid('topic');
-    next.topics.push({ id: newTopicId, name, icon, createdAt: new Date().toISOString(), batches: [] });
+    next.topics.push({ id: newTopicId, name, createdAt: new Date().toISOString(), batches: [] });
   } else {
     const t = next.topics.find(x=>x.id===APP.topicModalEditId);
-    if (t){ t.name = name; t.icon = icon; }
+    if (t) t.name = name;
   }
   next.meta.updatedAt = new Date().toISOString();
   const ok = await publishState(next);
@@ -1982,12 +1954,6 @@ function onGlobalClick(e){
     else if (action==='open-topic-modal') showTopicModal(null);
     else if (action==='rename-topic') showTopicModal(actionEl.dataset.topic);
     else if (action==='save-topic-modal') saveTopicModal();
-    else if (action==='pick-topic-icon'){
-      const icon = actionEl.dataset.icon;
-      const inp = document.getElementById('topic-modal-icon');
-      if (inp) inp.value = icon;
-      document.querySelectorAll('.icon-pick').forEach(el=> el.classList.toggle('selected', el.dataset.icon===icon));
-    }
     else if (action==='delete-topic') deleteTopic(actionEl.dataset.topic);
     else if (action==='preview-cert') showCertPreview(actionEl.dataset.batch, actionEl.dataset.recipient);
     else if (action==='download-pdf') exportCertificate(actionEl.dataset.batch, actionEl.dataset.recipient, 'pdf');
