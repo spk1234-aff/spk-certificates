@@ -516,6 +516,43 @@ function wrapCanvasLines(ctx, text, maxWidth){
   return finalLines;
 }
 
+// Confirmed on real desktop Safari (via on-device diagnostics): ctx.measureText()
+// can report a width noticeably narrower than what ctx.fillText() actually paints
+// for the same font/string — so measureText() cannot be trusted to guarantee text
+// stays inside its box. This measures the REAL painted pixels instead: draw the
+// text to a throwaway canvas, then scan for the actual leftmost/rightmost inked
+// pixel. Slower than measureText(), but it reflects reality regardless of any
+// engine quirk, and is only used for the final overflow safety check (a handful
+// of calls per certificate, not a hot loop).
+function measureActualPaintedWidth(text, fontSpec, fontSizePx){
+  if (!text) return 0;
+  const pad = Math.max(20, Math.round(fontSizePx*0.5));
+  const scratchW = Math.ceil(fontSizePx * text.length * 1.6) + pad*2;
+  const scratchH = Math.ceil(fontSizePx * 2.6);
+  const scratch = document.createElement('canvas');
+  scratch.width = scratchW;
+  scratch.height = scratchH;
+  const sctx = scratch.getContext('2d');
+  sctx.font = fontSpec;
+  sctx.textAlign = 'left';
+  sctx.textBaseline = 'alphabetic';
+  sctx.fillStyle = '#000';
+  sctx.fillText(text, pad, Math.round(scratchH*0.65));
+  let data;
+  try{ data = sctx.getImageData(0, 0, scratchW, scratchH).data; }
+  catch(e){ return null; } // e.g. tainted canvas in some odd embedding — caller falls back
+  let minX = -1, maxX = -1;
+  for (let x=0; x<scratchW; x++){
+    let inked = false;
+    for (let y=0; y<scratchH; y++){
+      if (data[(y*scratchW+x)*4+3] > 10){ inked = true; break; }
+    }
+    if (inked){ if (minX<0) minX = x; maxX = x; }
+  }
+  if (maxX < 0) return 0;
+  return (maxX - minX + 1);
+}
+
 // Safari/iOS has a long-standing, well-documented bug class where a web font can
 // report as "loaded" via the Font Loading API yet Canvas 2D still silently draws
 // with a fallback font, because WebKit only reliably commits to using a font for
@@ -594,15 +631,16 @@ async function renderCertificateCanvas(batch, values){
       const ascent = hasBounds ? m.actualBoundingBoxAscent : f.fontSizePx * 0.72;
       const descent = hasBounds ? m.actualBoundingBoxDescent : f.fontSizePx * 0.22;
       const baselineY = lineCenterY + (ascent - descent) / 2;
-      // Final safety net: wrapCanvasLines decided how to break lines using
-      // measureText() with whatever font was resolved at that moment. If the
-      // font that actually paints (fillText) ends up even slightly wider —
-      // seen on iOS/WebKit when a custom font isn't fully committed for canvas
-      // use yet — a line can run past the certificate edge and clip invisibly.
-      // Re-measuring right here and compressing only if still too wide keeps
-      // every line visible no matter which font actually gets painted.
-      if (maxW && m.width > maxW){
-        const scale = maxW / m.width;
+      // Final safety net: on real Safari, ctx.measureText() has been confirmed
+      // (via on-device diagnostics) to sometimes report a NARROWER width than
+      // what fillText() actually paints — so m.width above cannot be trusted to
+      // decide whether a line fits. Measure the real painted pixels instead and
+      // clamp against that, so a line can never silently run off the certificate
+      // regardless of which engine's measureText() is lying.
+      const paintedWidth = maxW ? measureActualPaintedWidth(line, fontSpec, f.fontSizePx) : null;
+      const effectiveWidth = (typeof paintedWidth === 'number') ? paintedWidth : m.width;
+      if (maxW && effectiveWidth > maxW){
+        const scale = maxW / effectiveWidth;
         ctx.save();
         ctx.translate(x, baselineY);
         ctx.scale(scale, 1);
@@ -1615,8 +1653,13 @@ async function runDiagnostics(){
         const wIntended = tctx.measureText(sample).width;
         tctx.font = weight + ' ' + f.fontSizePx + 'px monospace';
         const wFallback = tctx.measureText(sample).width;
-        lines.push('  width @intended font: ' + wIntended.toFixed(1) + 'px');
+        lines.push('  width @intended font (measureText): ' + wIntended.toFixed(1) + 'px');
         lines.push('  width @generic "monospace" fallback: ' + wFallback.toFixed(1) + 'px' + (Math.abs(wIntended-wFallback) < 1 ? '  <-- SAME AS INTENDED: custom font likely NOT applied' : ''));
+        if (typeof measureActualPaintedWidth === 'function'){
+          const wPainted = measureActualPaintedWidth(sample, fontSpec, f.fontSizePx);
+          const diffPct = (typeof wPainted === 'number' && wIntended) ? Math.round(((wPainted-wIntended)/wIntended)*100) : null;
+          lines.push('  width @ACTUAL PAINTED PIXELS: ' + (typeof wPainted==='number' ? wPainted.toFixed(1)+'px' : 'n/a (getImageData failed)') + (diffPct!==null && Math.abs(diffPct)>=3 ? '  <-- ' + (diffPct>0?'+':'') + diffPct + '% vs measureText, engine is under/over-reporting' : ''));
+        }
 
         if (text && batch.template){
           const canvasW = batch.template.width;
